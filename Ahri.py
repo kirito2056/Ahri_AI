@@ -77,7 +77,7 @@ numericalized_data = numericalize_data(conversations, word2index)
 dataset = ConversationDataset(numericalized_data)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-model = SimpleEncoderDecoder(vocab_size, embedding_dim, hidden_dim)
+model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
