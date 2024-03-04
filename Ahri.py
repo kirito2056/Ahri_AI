@@ -42,31 +42,52 @@ class ConversationDataset(Dataset):
         input_indices, target_indices = self.data[index]
         return torch.tensor(input_indices), torch.tensor(target_indices)
 
+def custom_collate(batch):
+    max_input_len = max(len(seq[0]) for seq in batch)  # 최대 입력 시퀀스 길이
+    max_target_len = max(len(seq[1]) for seq in batch)  # 최대 타겟 시퀀스 길이
+
+    padded_input_seqs = []
+    padded_target_seqs = []
+    for seq in batch:
+        # 입력 시퀀스 패딩
+        padded_input_seq = torch.nn.functional.pad(seq[0], (0, max_input_len - len(seq[0])))
+        # 타겟 시퀀스 패딩
+        padded_target_seq = torch.nn.functional.pad(seq[1], (0, max_target_len - len(seq[1])))
+        # 패딩된 입력과 타겟 시퀀스를 리스트에 추가
+        padded_input_seqs.append(padded_input_seq.unsqueeze(0))  # 배치 차원 추가
+        padded_target_seqs.append(padded_target_seq.unsqueeze(0))  # 배치 차원 추가
+    return torch.cat(padded_input_seqs), torch.cat(padded_target_seqs)
+
 class EncoderDecoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim):
         super(EncoderDecoder, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.encoder = nn.GRU(embedding_dim, hidden_dim)
-        self.decoder = nn.GRU(embedding_dim, hidden_dim)
+        self.encoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
+        self.decoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, input_seq, target_seq):
         embedded_input = self.embedding(input_seq)
-        encoder_output, encoder_hidden = self.encoder(embedded_input)
+        encoder_output, _ = self.encoder(embedded_input)
+
+        # Initialize the decoder hidden state with encoder hidden state
+        # Initialize the decoder hidden state with zeros
+        decoder_hidden = encoder_output[:, -1:, :].clone().permute(1, 0, 2).contiguous()  # Initialize with last encoder hidden state
+        # decoder_hidden = torch.zeros(1, input_seq.size(0), hidden_dim, device=device)  # Initialize with zeros
 
         embedded_target = self.embedding(target_seq)
-        decoder_output, _ = self.decoder(embedded_target, encoder_hidden)
+        decoder_output, _ = self.decoder(embedded_target, decoder_hidden)
 
         output = self.fc(decoder_output)
         return output
 
 
-conversations = load_conversations('conversation_data.txt')
+conversations = load_conversations('dialogues_text.txt')
 
 word2index = build_vocab(conversations)
 vocab_size = len(word2index)
 
-input_dim = output_dim = vocab_size 
+input_dim = output_dim = vocab_size
 embedding_dim = 100
 hidden_dim = 128
 learning_rate = 0.001
@@ -75,7 +96,7 @@ num_epochs = 10
 numericalized_data = numericalize_data(conversations, word2index)
 
 dataset = ConversationDataset(numericalized_data)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
 
 model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 criterion = nn.CrossEntropyLoss()
