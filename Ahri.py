@@ -79,7 +79,7 @@ class EncoderDecoder(nn.Module):
         return output
 
 
-conversations = load_conversations('dialogues_text.txt')
+conversations = load_conversations('dialogues_train.txt')
 
 word2index = build_vocab(conversations)
 vocab_size = len(word2index)
@@ -109,4 +109,5 @@ for epoch in range(num_epochs):
     
     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
 
-torch.save(model.state_dict, __path__)
+PATH = '/Users/user/Desktop/Ahri_AI/engine/'
+torch.save(model.state_dict(), PATH + 'Ahri.pt')
