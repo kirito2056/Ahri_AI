@@ -79,7 +79,7 @@ class EncoderDecoder(nn.Module):
         return output
 
 
-conversations = load_conversations('dialogues_train.txt')
+conversations = load_conversations('dialogues_text.txt')
 
 word2index = build_vocab(conversations)
 vocab_size = len(word2index)
@@ -99,6 +99,7 @@ model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+"""
 for epoch in range(num_epochs):
     for input_seq, target_seq in dataloader:
         optimizer.zero_grad()
@@ -110,4 +111,48 @@ for epoch in range(num_epochs):
     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
 
 PATH = '/Users/user/Desktop/Ahri_AI/engine/'
-torch.save(model.state_dict(), PATH + 'Ahri.pt')
+torch.save(model.state_dict(), PATH + 'Ahri_state_dict.pt')
+"""
+
+# 상태 사전을 사용하여 모델 로드
+state_dict_path = '/Users/user/Desktop/Ahri_AI/engine/Ahri_state_dict.pt'
+model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
+model.load_state_dict(torch.load(state_dict_path, map_location=torch.device('cpu')))
+model.eval()
+
+# 입력 문장을 숫자로 변환하는 함수
+def numericalize_sentence(sentence, word2index):
+    return [word2index[word] for word in word_tokenize(sentence.lower())]
+
+# 숫자로 변환된 문장을 텐서로 변환하는 함수
+def tensorize_sentence(sentence_indices):
+    return torch.tensor([sentence_indices])
+
+# 예측 함수
+def predict(input_sentence, model, word2index, index2word):
+    numericalized_input = numericalize_sentence(input_sentence, word2index)
+    input_tensor = tensorize_sentence(numericalized_input)
+    with torch.no_grad():
+        output_tensor = model(input_tensor, input_tensor)  # 자기 자신을 입력으로 넣어 예측을 수행합니다.
+    predicted_indices = output_tensor.argmax(dim=-1).squeeze(0).tolist()  # 가장 높은 확률을 가진 단어의 인덱스를 선택합니다.
+    predicted_words = [index2word[idx] for idx in predicted_indices]  # 인덱스를 단어로 변환합니다.
+    return predicted_words
+
+conversations = load_conversations('dialogues_text.txt')
+
+# 단어 집합 생성
+vocab = build_vocab(conversations)
+vocab_size = len(vocab)
+
+# 단어를 인덱스로, 인덱스를 단어로 매핑하는 사전 생성
+word2index = {word: idx for idx, word in enumerate(vocab)}
+index2word = {idx: word for word, idx in word2index.items()}
+
+
+# 단어와 인덱스 사이의 매핑 생성
+index2word = {idx: word for word, idx in word2index.items()}
+
+while '저리가' not in input_text:
+    input_text = input()
+    predicted_words = predict(input_text, model, word2index, index2word)
+    print(' '.join(predicted_words))
