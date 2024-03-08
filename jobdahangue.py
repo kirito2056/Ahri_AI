@@ -1,7 +1,6 @@
 import openai
 
 # OpenAI API 액세스 키 설정
-tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 
 def generate_response(prompt, max_tokens=50):
     response = openai.Completion.create(
