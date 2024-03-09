@@ -111,12 +111,14 @@ for epoch in range(num_epochs):
     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
 
 PATH = '/Users/user/Desktop/Ahri_AI/engine/'
-torch.save(model.state_dict(), PATH + 'Ahri_state_dict.pt')
-"""
+torch.save(model.state_dict(), PATH + 'Ahri.pt')
 
+
+
+"""
 state_dict_path = '/Users/user/Desktop/Ahri_AI/engine/Ahri_state_dict.pt'
 model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
-model.load_state_dict(torch.load(state_dict_path, map_location=torch.device('cpu')))
+model.load_state_dict(torch.load(state_dict_path, map_location=torch.device('mps')))
 model.eval()
 
 def numericalize_sentence(sentence, word2index):
@@ -150,3 +152,4 @@ while 'get back' not in input_text:
     input_text = input("[ 사용자 ] : ")
     predicted_words = predict(input_text, model, word2index, index2word)
     print('[ Ahri ] : ' + ' '.join(predicted_words))]
+"""
