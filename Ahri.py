@@ -99,7 +99,7 @@ model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-"""
+
 for epoch in range(num_epochs):
     for input_seq, target_seq in dataloader:
         optimizer.zero_grad()
@@ -144,7 +144,9 @@ index2word = {idx: word for word, idx in word2index.items()}
 
 index2word = {idx: word for word, idx in word2index.items()}
 
-while '저리가' not in input_text:
-    input_text = input()
+input_text = ''
+
+while 'get back' not in input_text:
+    input_text = input("[ 사용자 ] : ")
     predicted_words = predict(input_text, model, word2index, index2word)
-    print(' '.join(predicted_words))
+    print('[ Ahri ] : ' + ' '.join(predicted_words))]
