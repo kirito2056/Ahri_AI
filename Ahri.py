@@ -57,7 +57,7 @@ def custom_collate(batch):
         padded_target_seqs.append(padded_target_seq.unsqueeze(0)) 
     return torch.cat(padded_input_seqs), torch.cat(padded_target_seqs)
 
-#모델
+#인코딩, 디코딩 작업 수행하는 클래스
 class EncoderDecoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim):
         super(EncoderDecoder, self).__init__()
