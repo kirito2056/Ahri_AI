@@ -99,7 +99,7 @@ model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-
+"""
 for epoch in range(num_epochs):
     for input_seq, target_seq in dataloader:
         optimizer.zero_grad()
@@ -112,11 +112,10 @@ for epoch in range(num_epochs):
 
 PATH = '/Users/user/Desktop/Ahri_AI/engine/'
 torch.save(model.state_dict(), PATH + 'Ahri.pt')
-
-
-
 """
-state_dict_path = '/Users/user/Desktop/Ahri_AI/engine/Ahri_state_dict.pt'
+
+
+state_dict_path = '/Users/user/Desktop/Ahri_AI/engine/Ahri.pt'
 model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
 model.load_state_dict(torch.load(state_dict_path, map_location=torch.device('mps')))
 model.eval()
@@ -151,5 +150,4 @@ input_text = ''
 while 'get back' not in input_text:
     input_text = input("[ 사용자 ] : ")
     predicted_words = predict(input_text, model, word2index, index2word)
-    print('[ Ahri ] : ' + ' '.join(predicted_words))]
-"""
+    print('[ Ahri ] : ' + ' '.join(predicted_words))
