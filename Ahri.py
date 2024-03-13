@@ -100,6 +100,7 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
 """
+
 for epoch in range(num_epochs):
     for input_seq, target_seq in dataloader:
         optimizer.zero_grad()
@@ -112,8 +113,8 @@ for epoch in range(num_epochs):
 
 PATH = '/Users/user/Desktop/Ahri_AI/engine/'
 torch.save(model.state_dict(), PATH + 'Ahri.pt')
-"""
 
+"""
 
 state_dict_path = '/Users/user/Desktop/Ahri_AI/engine/Ahri.pt'
 model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
