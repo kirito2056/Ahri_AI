@@ -35,12 +35,21 @@ def load_conversations(file_path):
     return conversations
 
 def build_vocab(conversations):
-    vocab = set(['<PAD>', '<SOS>', '<EOS>', '<UNK>']) # Special tokens 추가
+    # 스페셜 토큰은 고정 인덱스 부여 (PAD=0, SOS=1, EOS=2, UNK=3)
+    special_tokens = ['<PAD>', '<SOS>', '<EOS>', '<UNK>']
+
+    token_set = set()
     for input_text, target_text in conversations:
-        vocab.update(word_tokenize(input_text.lower()))
-        vocab.update(word_tokenize(target_text.lower()))
-    word2index = {word: idx for idx, word in enumerate(vocab)}
-    return word2index, vocab # vocab도 반환하도록 수정
+        token_set.update(word_tokenize(input_text.lower()))
+        token_set.update(word_tokenize(target_text.lower()))
+
+    # 스페셜 토큰을 제외하고 알파벳 순서로 정렬하여 결정적 인덱싱 보장
+    token_list = sorted(t for t in token_set if t not in special_tokens)
+    vocab_list = special_tokens + token_list
+
+    word2index = {word: idx for idx, word in enumerate(vocab_list)}
+    index2word = {idx: word for word, idx in word2index.items()}
+    return word2index, index2word
 
 def numericalize_data(conversations, word2index):
     numericalized_data = []
@@ -135,8 +144,8 @@ class EncoderDecoder(nn.Module):
 
 conversations = load_conversations('dialogues_text.txt')
 
-# build_vocab 수정 반영
-word2index, vocab = build_vocab(conversations)
+# build_vocab 수정 반영 (deterministic)
+word2index, index2word = build_vocab(conversations)
 vocab_size = len(word2index) # Special tokens 포함된 크기
 
 input_dim = output_dim = vocab_size
@@ -177,30 +186,43 @@ for epoch in range(num_epochs):
 model_dir = 'engine'
 os.makedirs(model_dir, exist_ok=True) # 디렉토리 없으면 생성
 model_path = os.path.join(model_dir, 'Ahri.pt')
-torch.save(model.state_dict(), model_path)
-print(f"Model saved to {model_path}")
+# 모델 상태 + 어휘 + 설정을 함께 저장 (결정적 재현성)
+checkpoint = {
+    'model_state_dict': model.state_dict(),
+    'word2index': word2index,
+    'index2word': index2word,
+    'config': {
+        'embedding_dim': embedding_dim,
+        'hidden_dim': hidden_dim,
+    },
+}
+torch.save(checkpoint, model_path)
+print(f"Checkpoint saved to {model_path}")
 
 # --- 예측 부분 ---
 model_dir = 'engine' # 상대 경로 사용
 model_path = os.path.join(model_dir, 'Ahri.pt')
 
-# 모델 로드 시에도 업데이트된 vocab_size 사용
-model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
-
 # 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# 모델 로드 시 map_location 설정
-model.load_state_dict(torch.load(model_path, map_location=device))
-model.to(device) # 모델을 해당 디바이스로 이동
+# 체크포인트 로드 (모델+어휘+설정)
+ckpt = torch.load(model_path, map_location=device)
+loaded_word2index = ckpt['word2index']
+loaded_index2word = ckpt['index2word']
+loaded_config = ckpt['config']
+
+# 체크포인트 설정으로 모델 재생성 및 가중치 로드
+vocab_size_loaded = len(loaded_word2index)
+model = EncoderDecoder(vocab_size_loaded, loaded_config['embedding_dim'], loaded_config['hidden_dim'])
+model.load_state_dict(ckpt['model_state_dict'])
+model.to(device)
 model.eval()
 
-# 예측을 위한 어휘 정보 (학습 시 사용한 것과 동일해야 함)
-# 실제로는 학습 시 저장한 어휘 파일을 로드하는 것이 좋음
-conversations_for_vocab = load_conversations('dialogues_text.txt')
-word2index_predict, _ = build_vocab(conversations_for_vocab) # 예측용 어휘 로드
-index2word_predict = {idx: word for word, idx in word2index_predict.items()} # index2word 생성
+# 예측용 어휘 매핑 (학습 시 저장된 것 사용)
+word2index_predict = loaded_word2index
+index2word = loaded_index2word
 
 def numericalize_sentence(sentence, word2index):
     # UNK 토큰 처리 추가
@@ -300,8 +322,7 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
 
     return predicted_words
 
-# index2word 생성 (예측용 사용)
-index2word = {idx: word for word, idx in word2index_predict.items()}
+# index2word는 체크포인트에서 로드됨
 
 # 메인 루프
 print("[ Ahri ] : 안녕하세요! 무엇을 도와드릴까요? (종료하려면 'get back' 입력)")
