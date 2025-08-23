@@ -7,12 +7,19 @@ import numpy as np
 import os # 파일 경로 처리를 위해 추가
 import torch.nn.functional as F # log_softmax 사용을 위해 추가
 import heapq # Beam Search에서 top-k 후보 관리를 위해 추가
+import nltk
 
 # Special tokens
 PAD_token = 0
 SOS_token = 1
 EOS_token = 2
 UNK_token = 3
+
+def ensure_nltk_punkt():
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
 
 def load_conversations(file_path):
     conversations = []
@@ -91,7 +98,7 @@ def custom_collate(batch):
 class EncoderDecoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim):
         super(EncoderDecoder, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=PAD_token)
         self.encoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
         self.decoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, vocab_size)
@@ -142,88 +149,6 @@ class EncoderDecoder(nn.Module):
             return output
 
 
-conversations = load_conversations('dialogues_text.txt')
-
-# build_vocab 수정 반영 (deterministic)
-word2index, index2word = build_vocab(conversations)
-vocab_size = len(word2index) # Special tokens 포함된 크기
-
-input_dim = output_dim = vocab_size
-embedding_dim = 100
-hidden_dim = 128
-learning_rate = 0.001
-num_epochs = 10 # 에포크 수 증가 (예: 50 또는 100)
-
-numericalized_data = numericalize_data(conversations, word2index)
-
-dataset = ConversationDataset(numericalized_data)
-# DataLoader의 collate_fn 수정 반영 확인
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
-
-model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim)
-# PAD 토큰은 손실 계산에서 제외
-criterion = nn.CrossEntropyLoss(ignore_index=PAD_token)
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-# 학습 루프 (수정된 모델 forward 및 criterion 사용)
-for epoch in range(num_epochs):
-    for input_seq, target_seq in dataloader:
-        optimizer.zero_grad()
-        # 모델 forward 호출 방식 변경됨 (학습 시에는 target_seq 전달)
-        output = model(input_seq, target_seq)
-        # 손실 계산 시 output과 target_seq 형태 맞춰주기
-        # output: (batch_size, seq_len, vocab_size)
-        # target_seq: (batch_size, seq_len)
-        loss = criterion(output.view(-1, vocab_size), target_seq.view(-1))
-        loss.backward()
-        # 기울기 클리핑 추가 (기울기 폭주 방지)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
-
-# 상대 경로 사용 및 engine 디렉토리 생성 확인
-model_dir = 'engine'
-os.makedirs(model_dir, exist_ok=True) # 디렉토리 없으면 생성
-model_path = os.path.join(model_dir, 'Ahri.pt')
-# 모델 상태 + 어휘 + 설정을 함께 저장 (결정적 재현성)
-checkpoint = {
-    'model_state_dict': model.state_dict(),
-    'word2index': word2index,
-    'index2word': index2word,
-    'config': {
-        'embedding_dim': embedding_dim,
-        'hidden_dim': hidden_dim,
-    },
-}
-torch.save(checkpoint, model_path)
-print(f"Checkpoint saved to {model_path}")
-
-# --- 예측 부분 ---
-model_dir = 'engine' # 상대 경로 사용
-model_path = os.path.join(model_dir, 'Ahri.pt')
-
-# 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
-device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-# 체크포인트 로드 (모델+어휘+설정)
-ckpt = torch.load(model_path, map_location=device)
-loaded_word2index = ckpt['word2index']
-loaded_index2word = ckpt['index2word']
-loaded_config = ckpt['config']
-
-# 체크포인트 설정으로 모델 재생성 및 가중치 로드
-vocab_size_loaded = len(loaded_word2index)
-model = EncoderDecoder(vocab_size_loaded, loaded_config['embedding_dim'], loaded_config['hidden_dim'])
-model.load_state_dict(ckpt['model_state_dict'])
-model.to(device)
-model.eval()
-
-# 예측용 어휘 매핑 (학습 시 저장된 것 사용)
-word2index_predict = loaded_word2index
-index2word = loaded_index2word
-
 def numericalize_sentence(sentence, word2index):
     # UNK 토큰 처리 추가
     return [word2index.get(word, word2index['<UNK>']) for word in word_tokenize(sentence.lower())]
@@ -262,9 +187,6 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
                 # 마지막 토큰이 <EOS>면 완료된 beam으로 이동
                 if tokens[-1] == word2index['<EOS>']:
                     completed_beams.append((log_prob_sum, tokens))
-                    # 완료된 beam은 더 이상 확장하지 않음 (아래 for문 실행 방지)
-                    # beam_width 유지 위해 빈 튜플 추가 (임시 방편, heapq 사용 시 불필요)
-                    # heapq 방식으로 변경하면 이 부분 필요 없어짐
                     continue # 다음 beam 처리
 
                 # 디코더 입력 준비 (마지막 토큰)
@@ -289,7 +211,6 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
                     new_beams.append(new_beam)
 
             # 확장된 모든 new_beams 중에서 확률 높은 상위 beam_width개만 선택
-            # heapq를 사용하여 효율적으로 상위 k개 선택
             beams = heapq.nlargest(beam_width, new_beams, key=lambda x: x[0])
 
             # 모든 활성 beam이 종료되었는지 확인 (선택적: 조기 종료)
@@ -298,13 +219,9 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
                  break
 
         # 4. 최종 결과 선택
-        # 완료된 beam이 없으면 현재 가장 확률 높은 beam 사용
         if not completed_beams:
             completed_beams.extend(beams)
 
-        # 확률 정규화 (길이로 나누기)하여 가장 좋은 beam 선택 (선택적)
-        # completed_beams.sort(key=lambda x: x[0] / len(x[1]), reverse=True)
-        # 여기서는 단순 확률 합계로 정렬
         completed_beams.sort(key=lambda x: x[0], reverse=True)
 
         best_beam_tokens = completed_beams[0][1]
@@ -322,16 +239,108 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
 
     return predicted_words
 
-# index2word는 체크포인트에서 로드됨
+def train_model():
+    ensure_nltk_punkt()
 
-# 메인 루프
-print("[ Ahri ] : 안녕하세요! 무엇을 도와드릴까요? (종료하려면 'get back' 입력)")
-input_text = ''
-while 'get back' not in input_text.lower(): # 종료 조건 소문자 처리
-    input_text = input("[ 사용자 ] : ")
-    if 'get back' in input_text.lower(): # 종료 조건 확인
-        break
-    predicted_words = predict(input_text, model, word2index_predict, index2word, device) # device 전달
-    print('[ Ahri ] : ' + ' '.join(predicted_words))
+    conversations = load_conversations('dialogues_text.txt')
 
-print("[ Ahri ] : 다음에 또 만나요!")
+    # build_vocab 수정 반영 (deterministic)
+    word2index, index2word = build_vocab(conversations)
+    vocab_size = len(word2index) # Special tokens 포함된 크기
+
+    embedding_dim = 100
+    hidden_dim = 128
+    learning_rate = 0.001
+    num_epochs = 10 # 에포크 수 증가 (예: 50 또는 100)
+
+    numericalized_data = numericalize_data(conversations, word2index)
+
+    dataset = ConversationDataset(numericalized_data)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
+
+    # 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim).to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_token)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    # 학습 루프
+    for epoch in range(num_epochs):
+        for input_seq, target_seq in dataloader:
+            input_seq = input_seq.to(device)
+            target_seq = target_seq.to(device)
+
+            optimizer.zero_grad()
+            output = model(input_seq, target_seq)
+            loss = criterion(output.view(-1, vocab_size), target_seq.view(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+
+    # 체크포인트 저장
+    model_dir = 'engine'
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, 'Ahri.pt')
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'word2index': word2index,
+        'index2word': index2word,
+        'config': {
+            'embedding_dim': embedding_dim,
+            'hidden_dim': hidden_dim,
+        },
+    }
+    torch.save(checkpoint, model_path)
+    print(f"Checkpoint saved to {model_path}")
+
+def run_inference():
+    ensure_nltk_punkt()
+
+    # 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    model_dir = 'engine'
+    model_path = os.path.join(model_dir, 'Ahri.pt')
+
+    # 체크포인트 로드 (모델+어휘+설정)
+    ckpt = torch.load(model_path, map_location=device)
+    loaded_word2index = ckpt['word2index']
+    loaded_index2word = ckpt['index2word']
+    loaded_config = ckpt['config']
+
+    vocab_size_loaded = len(loaded_word2index)
+    model = EncoderDecoder(vocab_size_loaded, loaded_config['embedding_dim'], loaded_config['hidden_dim'])
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.to(device)
+    model.eval()
+
+    word2index_predict = loaded_word2index
+    index2word = loaded_index2word
+
+    # 메인 루프
+    print("[ Ahri ] : 안녕하세요! 무엇을 도와드릴까요? (종료하려면 'get back' 입력)")
+    input_text = ''
+    while 'get back' not in input_text.lower(): # 종료 조건 소문자 처리
+        input_text = input("[ 사용자 ] : ")
+        if 'get back' in input_text.lower(): # 종료 조건 확인
+            break
+        predicted_words = predict(input_text, model, word2index_predict, index2word, device)
+        print('[ Ahri ] : ' + ' '.join(predicted_words))
+
+    print("[ Ahri ] : 다음에 또 만나요!")
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['train', 'infer'], default='infer')
+    args = parser.parse_args()
+
+    if args.mode == 'train':
+        train_model()
+    else:
+        run_inference()
