@@ -159,7 +159,138 @@ def tensorize_sentence(sentence_indices, device): # device 인자 추가
 MAX_LENGTH = 50 # 최대 생성 길이
 BEAM_WIDTH = 3 # Beam Search 너비 (조절 가능)
 
-def predict(input_sentence, model, word2index, index2word, device, max_length=MAX_LENGTH, beam_width=BEAM_WIDTH): # beam_width 추가
+def _apply_repetition_penalty(logits, generated_tokens, repetition_penalty: float):
+    if repetition_penalty == 1.0 or len(generated_tokens) == 0:
+        return logits
+    unique_tokens = set(generated_tokens)
+    for token_id in unique_tokens:
+        logits[0, token_id] /= repetition_penalty
+    return logits
+
+def _get_ngram_banned_tokens(generated_tokens, no_repeat_ngram_size: int):
+    if no_repeat_ngram_size <= 1 or len(generated_tokens) < no_repeat_ngram_size - 1:
+        return set()
+    n = no_repeat_ngram_size
+    prefix_to_next = {}
+    for i in range(len(generated_tokens) - n + 1):
+        prefix = tuple(generated_tokens[i:i + n - 1])
+        next_tok = generated_tokens[i + n - 1]
+        prefix_to_next.setdefault(prefix, set()).add(next_tok)
+    current_prefix = tuple(generated_tokens[-(n - 1):])
+    return prefix_to_next.get(current_prefix, set())
+
+def _top_k_top_p_filtering(logits, top_k: int = 0, top_p: float = 1.0):
+    # logits: (1, vocab)
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        threshold = torch.topk(logits, top_k)[0][..., -1, None]
+        logits = torch.where(logits < threshold, torch.full_like(logits, float('-inf')), logits)
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
+    return logits
+
+def _decode_greedy(model, device, word2index, max_length, initial_hidden, repetition_penalty=1.0, no_repeat_ngram_size=0):
+    decoder_hidden = initial_hidden
+    decoded_tokens = [word2index['<SOS>']]
+    for _ in range(max_length):
+        decoder_input = torch.tensor([[decoded_tokens[-1]]], device=device)
+        embedded_decoder_input = model.embedding(decoder_input)
+        decoder_output, decoder_hidden = model.decoder(embedded_decoder_input, decoder_hidden)
+        logits = model.fc(decoder_output.squeeze(0)) # (1, vocab)
+        logits = _apply_repetition_penalty(logits, decoded_tokens, repetition_penalty)
+        banned = _get_ngram_banned_tokens(decoded_tokens, no_repeat_ngram_size)
+        if len(banned) > 0:
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            mask[0, list(banned)] = True
+            logits = logits.masked_fill(mask, float('-inf'))
+        next_token = torch.argmax(logits, dim=-1).item()
+        decoded_tokens.append(next_token)
+        if next_token == word2index['<EOS>']:
+            break
+    return decoded_tokens
+
+def _decode_beam(model, device, word2index, max_length, initial_hidden, beam_width, length_alpha=0.0, repetition_penalty=1.0, no_repeat_ngram_size=0):
+    start_token_index = word2index['<SOS>']
+    beams = [(0.0, [start_token_index], initial_hidden)] # (score, tokens, hidden)
+    completed = []
+    for _ in range(max_length):
+        new_beams = []
+        for score, tokens, hidden in beams:
+            if tokens[-1] == word2index['<EOS>']:
+                completed.append((score, tokens))
+                continue
+            decoder_input = torch.tensor([[tokens[-1]]], device=device)
+            embedded_decoder_input = model.embedding(decoder_input)
+            decoder_output, next_hidden = model.decoder(embedded_decoder_input, hidden)
+            logits = model.fc(decoder_output.squeeze(0))
+            logits = _apply_repetition_penalty(logits, tokens, repetition_penalty)
+            banned = _get_ngram_banned_tokens(tokens, no_repeat_ngram_size)
+            if len(banned) > 0:
+                mask = torch.zeros_like(logits, dtype=torch.bool)
+                mask[0, list(banned)] = True
+                logits = logits.masked_fill(mask, float('-inf'))
+            log_probs = F.log_softmax(logits, dim=-1)
+            top_log_probs, top_indices = log_probs.topk(beam_width)
+            for i in range(beam_width):
+                next_token = top_indices[0, i].item()
+                next_log_prob = top_log_probs[0, i].item()
+                new_tokens = tokens + [next_token]
+                new_score = score + next_log_prob
+                new_beams.append((new_score, new_tokens, next_hidden))
+        if not new_beams:
+            break
+        beams = heapq.nlargest(beam_width, new_beams, key=lambda x: x[0])
+        if all(b[1][-1] == word2index['<EOS>'] for b in beams):
+            completed.extend([(s, t) for s, t, _ in beams])
+            break
+    if not completed:
+        completed.extend([(s, t) for s, t, _ in beams])
+    if length_alpha > 0.0:
+        completed.sort(key=lambda x: x[0] / (len(x[1]) ** length_alpha), reverse=True)
+    else:
+        completed.sort(key=lambda x: x[0], reverse=True)
+    return completed[0][1]
+
+def _decode_sample(model, device, word2index, max_length, initial_hidden, temperature=1.0, top_k=0, top_p=1.0, repetition_penalty=1.0, no_repeat_ngram_size=0):
+    decoder_hidden = initial_hidden
+    decoded_tokens = [word2index['<SOS>']]
+    for _ in range(max_length):
+        decoder_input = torch.tensor([[decoded_tokens[-1]]], device=device)
+        embedded_decoder_input = model.embedding(decoder_input)
+        decoder_output, decoder_hidden = model.decoder(embedded_decoder_input, decoder_hidden)
+        logits = model.fc(decoder_output.squeeze(0))
+        if temperature != 1.0:
+            logits = logits / temperature
+        logits = _apply_repetition_penalty(logits, decoded_tokens, repetition_penalty)
+        banned = _get_ngram_banned_tokens(decoded_tokens, no_repeat_ngram_size)
+        if len(banned) > 0:
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            mask[0, list(banned)] = True
+            logits = logits.masked_fill(mask, float('-inf'))
+        logits = _top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+        decoded_tokens.append(next_token)
+        if next_token == word2index['<EOS>']:
+            break
+    return decoded_tokens
+
+def _decode_self_consistency(sample_fn, num_samples):
+    sequences = []
+    counts = {}
+    for _ in range(num_samples):
+        seq = sample_fn()
+        sequences.append(tuple(seq))
+        counts[sequences[-1]] = counts.get(sequences[-1], 0) + 1
+    best = max(counts.items(), key=lambda x: x[1])[0]
+    return list(best)
+
+def predict(input_sentence, model, word2index, index2word, device, max_length=MAX_LENGTH, beam_width=BEAM_WIDTH, strategy='beam', temperature=1.0, top_k=0, top_p=1.0, repetition_penalty=1.0, no_repeat_ngram_size=0, num_samples=5, length_alpha=0.0): # AZR 옵션 추가
     model.eval() # 예측 모드 설정
     numericalized_input = numericalize_sentence(input_sentence, word2index)
     if not numericalized_input:
@@ -170,61 +301,22 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
         # 1. 인코더 실행
         embedded_input = model.embedding(input_tensor)
         encoder_outputs, encoder_hidden = model.encoder(embedded_input)
-
-        # 2. Beam Search 초기화
-        # 각 beam은 (log 확률 합계, [토큰 인덱스 리스트], 디코더 히든 상태) 튜플
-        # 초기 beam: <SOS> 토큰으로 시작
-        decoder_hidden = encoder_hidden # 인코더의 마지막 hidden state 사용
-        start_token_index = word2index['<SOS>']
-        initial_beam = (0.0, [start_token_index], decoder_hidden)
-        beams = [initial_beam]
-        completed_beams = []
-
-        # 3. Beam Search 단계별 실행
-        for _ in range(max_length):
-            new_beams = []
-            for log_prob_sum, tokens, hidden in beams:
-                # 마지막 토큰이 <EOS>면 완료된 beam으로 이동
-                if tokens[-1] == word2index['<EOS>']:
-                    completed_beams.append((log_prob_sum, tokens))
-                    continue # 다음 beam 처리
-
-                # 디코더 입력 준비 (마지막 토큰)
-                decoder_input = torch.tensor([[tokens[-1]]], device=device)
-                embedded_decoder_input = model.embedding(decoder_input)
-
-                # 디코더 실행
-                decoder_output, next_hidden = model.decoder(embedded_decoder_input, hidden)
-                output_logits = model.fc(decoder_output.squeeze(0))
-                log_probs = F.log_softmax(output_logits, dim=-1) # Log 확률 계산
-
-                # Top-k 후보 토큰 선택 (beam_width개)
-                top_log_probs, top_indices = log_probs.topk(beam_width)
-
-                # 각 후보 토큰으로 beam 확장
-                for i in range(beam_width):
-                    next_token_index = top_indices[0][i].item()
-                    next_log_prob = top_log_probs[0][i].item()
-                    new_log_prob_sum = log_prob_sum + next_log_prob
-                    new_tokens = tokens + [next_token_index]
-                    new_beam = (new_log_prob_sum, new_tokens, next_hidden)
-                    new_beams.append(new_beam)
-
-            # 확장된 모든 new_beams 중에서 확률 높은 상위 beam_width개만 선택
-            beams = heapq.nlargest(beam_width, new_beams, key=lambda x: x[0])
-
-            # 모든 활성 beam이 종료되었는지 확인 (선택적: 조기 종료)
-            if all(b[1][-1] == word2index['<EOS>'] for b in beams):
-                 completed_beams.extend(beams) # 현재 beam들도 완료 처리
-                 break
-
-        # 4. 최종 결과 선택
-        if not completed_beams:
-            completed_beams.extend(beams)
-
-        completed_beams.sort(key=lambda x: x[0], reverse=True)
-
-        best_beam_tokens = completed_beams[0][1]
+        # 2. 전략별 디코딩
+        if strategy == 'greedy':
+            best_beam_tokens = _decode_greedy(model, device, word2index, max_length, encoder_hidden, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
+        elif strategy == 'beam':
+            best_beam_tokens = _decode_beam(model, device, word2index, max_length, encoder_hidden, beam_width, length_alpha=length_alpha, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
+        elif strategy == 'sample':
+            best_beam_tokens = _decode_sample(model, device, word2index, max_length, encoder_hidden, temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
+        elif strategy == 'self_consistency':
+            def _sample_once():
+                return _decode_sample(model, device, word2index, max_length, encoder_hidden, temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
+            best_beam_tokens = _decode_self_consistency(_sample_once, num_samples=num_samples)
+        else: # auto
+            if ('?' in input_sentence) or (len(numericalized_input) >= 12):
+                best_beam_tokens = _decode_sample(model, device, word2index, max_length, encoder_hidden, temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
+            else:
+                best_beam_tokens = _decode_beam(model, device, word2index, max_length, encoder_hidden, beam_width, length_alpha=length_alpha, repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size)
 
     # 5. 결과 후처리 (토큰 -> 단어 변환, 특수 토큰 제거)
     predicted_words = []
@@ -297,7 +389,7 @@ def train_model():
     torch.save(checkpoint, model_path)
     print(f"Checkpoint saved to {model_path}")
 
-def run_inference():
+def run_inference(args=None):
     ensure_nltk_punkt()
 
     # 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
@@ -321,26 +413,26 @@ def run_inference():
 
     word2index_predict = loaded_word2index
     index2word = loaded_index2word
-
-    # 메인 루프
-    print("[ Ahri ] : 안녕하세요! 무엇을 도와드릴까요? (종료하려면 'get back' 입력)")
-    input_text = ''
-    while 'get back' not in input_text.lower(): # 종료 조건 소문자 처리
-        input_text = input("[ 사용자 ] : ")
-        if 'get back' in input_text.lower(): # 종료 조건 확인
-            break
-        predicted_words = predict(input_text, model, word2index_predict, index2word, device)
-        print('[ Ahri ] : ' + ' '.join(predicted_words))
-
-    print("[ Ahri ] : 다음에 또 만나요!")
+ 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['train', 'infer'], default='infer')
+    # AZR/디코딩 옵션
+    parser.add_argument('--strategy', choices=['auto', 'beam', 'greedy', 'sample', 'self_consistency'], default='auto')
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--top_k', type=int, default=0)
+    parser.add_argument('--top_p', type=float, default=1.0)
+    parser.add_argument('--repetition_penalty', type=float, default=1.0)
+    parser.add_argument('--no_repeat_ngram_size', type=int, default=0)
+    parser.add_argument('--beam_width', type=int, default=BEAM_WIDTH)
+    parser.add_argument('--max_length', type=int, default=MAX_LENGTH)
+    parser.add_argument('--num_samples', type=int, default=5)
+    parser.add_argument('--length_alpha', type=float, default=0.0)
     args = parser.parse_args()
 
     if args.mode == 'train':
         train_model()
     else:
-        run_inference()
+        run_inference(args)
