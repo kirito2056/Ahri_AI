@@ -8,6 +8,11 @@ import os # 파일 경로 처리를 위해 추가
 import torch.nn.functional as F # log_softmax 사용을 위해 추가
 import heapq # Beam Search에서 top-k 후보 관리를 위해 추가
 import nltk
+import random
+import math
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
 
 # Special tokens
 PAD_token = 0
@@ -85,6 +90,8 @@ def custom_collate(batch):
 
     padded_input_seqs = []
     padded_target_seqs = []
+    input_lengths = []
+    target_lengths = []
     for seq in batch:
         # PAD 토큰 인덱스(0)로 패딩
         padded_input_seq = torch.nn.functional.pad(seq[0], (0, max_input_len - len(seq[0])), value=PAD_token)
@@ -92,7 +99,14 @@ def custom_collate(batch):
 
         padded_input_seqs.append(padded_input_seq.unsqueeze(0))
         padded_target_seqs.append(padded_target_seq.unsqueeze(0))
-    return torch.cat(padded_input_seqs), torch.cat(padded_target_seqs)
+        input_lengths.append(len(seq[0]))
+        target_lengths.append(len(seq[1]))
+    return (
+        torch.cat(padded_input_seqs),
+        torch.cat(padded_target_seqs),
+        torch.tensor(input_lengths, dtype=torch.long),
+        torch.tensor(target_lengths, dtype=torch.long),
+    )
 
 #인코딩, 디코딩 작업 수행하는 클래스
 class EncoderDecoder(nn.Module):
@@ -102,10 +116,16 @@ class EncoderDecoder(nn.Module):
         self.encoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
         self.decoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, vocab_size)
+        self.dropout = nn.Dropout(p=0.2)
 
-    def forward(self, input_seq, target_seq=None, max_length=50): # 예측 시 target_seq는 None, max_length 추가
-        embedded_input = self.embedding(input_seq)
-        encoder_output, encoder_hidden = self.encoder(embedded_input) # encoder_hidden도 받음
+    def forward(self, input_seq, target_seq=None, max_length=50, input_lengths=None): # 예측 시 target_seq는 None, max_length 추가
+        embedded_input = self.dropout(self.embedding(input_seq))
+        if input_lengths is not None:
+            packed = pack_padded_sequence(embedded_input, input_lengths.cpu(), batch_first=True, enforce_sorted=False)
+            encoder_output, encoder_hidden = self.encoder(packed)
+            encoder_output, _ = pad_packed_sequence(encoder_output, batch_first=True)
+        else:
+            encoder_output, encoder_hidden = self.encoder(embedded_input) # encoder_hidden도 받음
 
         # 예측 모드 (target_seq가 없을 때)
         if target_seq is None:
@@ -115,10 +135,10 @@ class EncoderDecoder(nn.Module):
             decoded_outputs = []
 
             for _ in range(max_length):
-                embedded_decoder_input = self.embedding(decoder_input)
+                embedded_decoder_input = self.dropout(self.embedding(decoder_input))
                 # decoder_hidden 유지하며 순환
                 decoder_output, decoder_hidden = self.decoder(embedded_decoder_input, decoder_hidden)
-                output = self.fc(decoder_output) # (batch_size, 1, vocab_size)
+                output = self.fc(self.dropout(decoder_output)) # (batch_size, 1, vocab_size)
 
                 # Greedy decoding
                 topv, topi = output.topk(1, dim=2)
@@ -142,10 +162,10 @@ class EncoderDecoder(nn.Module):
             # <SOS> 토큰을 타겟 시퀀스 앞에 추가하여 디코더 입력 생성
             sos_tensor = torch.tensor([[SOS_token]], device=target_seq.device).repeat(target_seq.size(0), 1)
             decoder_input_seq = torch.cat((sos_tensor, target_seq[:, :-1]), dim=1) # 마지막 토큰 제외하고 <SOS> 추가
-            embedded_target = self.embedding(decoder_input_seq)
+            embedded_target = self.dropout(self.embedding(decoder_input_seq))
 
             decoder_output, _ = self.decoder(embedded_target, decoder_hidden)
-            output = self.fc(decoder_output)
+            output = self.fc(self.dropout(decoder_output))
             return output
 
 
@@ -333,6 +353,7 @@ def predict(input_sentence, model, word2index, index2word, device, max_length=MA
 
 def train_model():
     ensure_nltk_punkt()
+    set_seed(42)
 
     conversations = load_conversations('dialogues_text.txt')
 
@@ -348,7 +369,14 @@ def train_model():
     numericalized_data = numericalize_data(conversations, word2index)
 
     dataset = ConversationDataset(numericalized_data)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
+    # 검증셋 분리 (90/10)
+    val_ratio = 0.1
+    val_size = max(1, int(len(dataset) * val_ratio))
+    train_size = len(dataset) - val_size
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate)
 
     # 디바이스 설정 (가용 시 MPS 사용, 아니면 CPU)
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -357,37 +385,81 @@ def train_model():
     model = EncoderDecoder(vocab_size, embedding_dim, hidden_dim).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_token)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
     # 학습 루프
+    best_val_loss = float('inf')
+    patience = 3
+    epochs_without_improve = 0
     for epoch in range(num_epochs):
-        for input_seq, target_seq in dataloader:
+        model.train()
+        running_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        for input_seq, target_seq, input_lengths, target_lengths in pbar:
             input_seq = input_seq.to(device)
             target_seq = target_seq.to(device)
+            input_lengths = input_lengths.to(device)
 
             optimizer.zero_grad()
-            output = model(input_seq, target_seq)
+            output = model(input_seq, target_seq, input_lengths=input_lengths)
             loss = criterion(output.view(-1, vocab_size), target_seq.view(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            running_loss += loss.item()
+            pbar.set_postfix({"train_loss": f"{loss.item():.4f}", "ppl": f"{math.exp(min(20, loss.item())):.2f}"})
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+        avg_train_loss = running_loss / max(1, len(train_loader))
 
-    # 체크포인트 저장
-    model_dir = 'engine'
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, 'Ahri.pt')
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'word2index': word2index,
-        'index2word': index2word,
-        'config': {
-            'embedding_dim': embedding_dim,
-            'hidden_dim': hidden_dim,
-        },
-    }
-    torch.save(checkpoint, model_path)
-    print(f"Checkpoint saved to {model_path}")
+        # 검증
+        model.eval()
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for input_seq, target_seq, input_lengths, target_lengths in val_loader:
+                input_seq = input_seq.to(device)
+                target_seq = target_seq.to(device)
+                input_lengths = input_lengths.to(device)
+                output = model(input_seq, target_seq, input_lengths=input_lengths)
+                loss = criterion(output.view(-1, vocab_size), target_seq.view(-1))
+                val_loss_sum += loss.item()
+        avg_val_loss = val_loss_sum / max(1, len(val_loader))
+        scheduler.step(avg_val_loss)
+
+        print(f"Epoch [{epoch+1}/{num_epochs}] | train_loss={avg_train_loss:.4f} (ppl {math.exp(min(20, avg_train_loss)):.2f}) | val_loss={avg_val_loss:.4f} (ppl {math.exp(min(20, avg_val_loss)):.2f})")
+
+        # Early stopping 및 베스트 체크포인트 저장
+        model_dir = 'engine'
+        os.makedirs(model_dir, exist_ok=True)
+        best_path = os.path.join(model_dir, 'Ahri.pt')
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_without_improve = 0
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'word2index': word2index,
+                'index2word': index2word,
+                'config': {
+                    'embedding_dim': embedding_dim,
+                    'hidden_dim': hidden_dim,
+                },
+            }
+            torch.save(checkpoint, best_path)
+            print(f"Saved best checkpoint to {best_path}")
+        else:
+            epochs_without_improve += 1
+            if epochs_without_improve >= patience:
+                print("Early stopping triggered.")
+        break
+    print("Training finished.")
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def run_inference(args=None):
     ensure_nltk_punkt()
